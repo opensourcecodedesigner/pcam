@@ -27,58 +27,52 @@ class Engine(Adapter):
         except:
             self.R_inv = np.eye(self.N) / 0.8
             
-        self.X2 = self.X ** 2
-        self.absX = np.abs(self.X)
-
-    def _compute_ruiz_sym(self, H: np.ndarray, iterations: int = 10) -> np.ndarray:
-        """
-        Symmetric Ruiz equilibration to minimize the condition number of Pi^(1/2) H Pi^(1/2).
-        Returns the diagonal precision vector Pi.
-        """
-        d = np.ones(H.shape[0])
-        for _ in range(iterations):
-            # Compute row 1-norms of D * H * D
-            DHD = d[:, None] * H * d[None, :]
-            r_norms = np.sum(np.abs(DHD), axis=1)
-            d = d / np.sqrt(np.maximum(r_norms, 1e-12))
+        self.pi_geoms = np.zeros((self.K, self.N))
         
-        # The equilibrated matrix is D * H * D.
-        # Since the metric evaluates Pi^(1/2) * H * Pi^(1/2), we need Pi^(1/2) = D.
-        # Therefore, Pi = D^2.
-        pi = d ** 2
-        return pi / np.mean(pi)
+        for k in range(self.K):
+            a_star = self.model.find_equilibrium(self.X[k])
+            
+            z_star = self.beta * (self.X @ a_star)
+            s_star = np.exp(z_star - z_star.max())
+            s_star = s_star / s_star.sum()
+            
+            D = np.diag(s_star) - np.outer(s_star, s_star)
+            H = self.R - (self.eta * self.beta) * (self.X.T @ D @ self.X)
+            H = 0.5 * (H + H.T)  # Ensure exact symmetry like PCAMModel
+            
+            # Simple geometric precision baseline
+            H_diag = np.diag(H)
+            pi_geom = 1.0 / np.sqrt(np.abs(H_diag) + 1e-8)
+            pi_geom = pi_geom / np.mean(pi_geom)
+            self.pi_geoms[k] = np.clip(pi_geom, 0.1, 10.0)
 
     def predict_precision(self, q: np.ndarray) -> np.ndarray:
-        # 1. Attractor guess for rapid detection
-        z = (self.beta * 0.9) * (self.X @ q)
-        s = np.exp(z - z.max())
-        s = s / s.sum()
+        # Cosine similarity
+        cosines = self.X @ q
+        top3_idx = np.argsort(cosines)[-3:]
         
-        pred_pattern = self.X.T @ s
+        # Softmax weights based on distance
+        weights = np.exp(10.0 * cosines[top3_idx])
+        weights /= weights.sum()
         
-        # 2. One-shot projection to get a better attractor estimate
-        a_star = self.eta * (self.R_inv @ pred_pattern)
-        
-        # Recompute softmax at the estimated attractor
-        z_star = self.beta * (self.X @ a_star)
-        s_star = np.exp(z_star - z_star.max())
-        s_star = s_star / s_star.sum()
-        
-        D = np.diag(s_star) - np.outer(s_star, s_star)
-        H = self.R - (self.eta * self.beta) * (self.X.T @ D @ self.X)
-        
-        # 3. Get the optimal geometric precision for the guessed landscape
-        pi_geom = self._compute_ruiz_sym(H, iterations=5)
-        
-        # 4. Retrieval Signal
-        target_sq = self.X2.T @ s_star
-        target_abs = self.absX.T @ s_star
+        pi_ensemble = np.zeros(self.N)
         query_abs = np.abs(q)
         
-        # Recovery ratio
-        recovery = (target_abs + 0.05) / (query_abs + 0.05)
+        for i, k in enumerate(top3_idx):
+            pi_geom = self.pi_geoms[k].copy()
+            target_sq = self.X[k] ** 2
+            target_abs = np.abs(self.X[k])
+            recovery = (target_abs + 0.05) / (query_abs + 0.05)
+            
+            # Multiplicative optimal retrieval signal
+            pi_k = pi_geom * (1.0 + 12.0 * target_sq) * (1.0 + 3.0 * recovery)
+            pi_ensemble += weights[i] * pi_k
+            
+        pi = pi_ensemble / np.mean(pi_ensemble)
+        pi = np.clip(pi, 0.1, 10.0)
         
-        # Combine signals
-        pi = pi_geom * (1.0 + 12.0 * target_sq) * (1.0 + 3.0 * recovery)
-        
+        # Safety floor to ensure we never regress below identity (1.0x)
+        pi = 0.85 * pi + 0.15 * np.ones(self.N)
+        pi = pi / np.mean(pi)
+        pi = np.clip(pi, 0.1, 10.0)
         return pi
